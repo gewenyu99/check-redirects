@@ -1,30 +1,27 @@
-const baseURL = "https://docs.trunk.io/"
 import * as cheerio from 'cheerio';
-import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { sleep } from 'bun';
-import { urlId, getGitShortHash } from './utils';
+import { mkdir } from "node:fs/promises";
+import { getPageHTML, urlId, getPageTitle } from './utils';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const BASE_URL = process.env.BASE_URL || "https://docs.trunk.io";
-const RATE_LIMIT_DELAY = parseInt(process.env.RATE_LIMIT_DELAY || "50");
-const MAX_DEPTH = process.env.MAX_DEPTH || 5;
-
 // Queue class for BFS traversal
-type URLItem = {
-    url: string;
-    depth: number;
+export type Page = {
+    url: string,
+    title: string,
+    children: Page[],
+    depth: number
 }
 class Queue {
-    private items: URLItem[];
+    private items: Page[];
 
     constructor() {
         this.items = [];
     }
     
-    enqueue(item: URLItem) {
+    enqueue(item: Page) {
         this.items.push(item);
     }
     
@@ -40,26 +37,26 @@ class Queue {
 
 async function crawlSite(baseURL: string, rateLimitDelay: number, maxDepth: number) {
     const visitedUrls = new Set();
-    const urlToParent = new Map();  // Keep track of parent-child relationships
     const queue = new Queue();
     const siteTree = {
-        url: baseURL,
+        url: '/',
         title: '',
-        children: []
-    };
+        children: [],
+        depth: 0
+    } as Page;
     
     // Start with the base URL
-    queue.enqueue({ url: baseURL, depth: 0 });
+    queue.enqueue(siteTree);
     visitedUrls.add(baseURL);
     
     while (!queue.isEmpty()) {
-        const item = queue.dequeue();
-        if (!item) {
+        const page = queue.dequeue();
+        if (!page) {
             continue;
         }
-        const { url, depth } = item;
+        const { url, depth } = page;
         
-        if (depth > maxDepth) {  // Max depth of 5
+        if (depth > maxDepth) { 
             continue;
         }
         
@@ -68,18 +65,15 @@ async function crawlSite(baseURL: string, rateLimitDelay: number, maxDepth: numb
             await sleep(rateLimitDelay);
             
             console.log(`Crawling ${url} (depth: ${depth})`);
-            const response = await fetch(url);
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-            const html = await response.text();
-            const $ = cheerio.load(html);
+
+            const completeURL = new URL(url, baseURL).toString();
+
+            const $ = cheerio.load(await getPageHTML(completeURL));
             
-            // Update title for the current URL in the tree
-            const title = $('title').text().trim();
-            if (url === baseURL) {
-                siteTree.title = title;
+            if (completeURL === baseURL) {
+                siteTree.title = getPageTitle($);
             }
+            page.title = getPageTitle($);
             
             // Find all navigation links
             $('a[href]').each((i, element) => {
@@ -88,7 +82,7 @@ async function crawlSite(baseURL: string, rateLimitDelay: number, maxDepth: numb
                 
                 // Skip empty links, external links, and anchor links
                 if (!href || !text || 
-                    href.startsWith('http') || 
+                    href.startsWith('http') ||
                     href.startsWith('#') ||
                     href.startsWith('mailto:') ||
                     href.startsWith('tel:')) {
@@ -96,36 +90,26 @@ async function crawlSite(baseURL: string, rateLimitDelay: number, maxDepth: numb
                 }
                 
                 try {
-                    const fullUrl = new URL(href, url).toString();
+                    const fullUrl = new URL(href, completeURL).toString();
                     if (fullUrl.startsWith(baseURL) && !visitedUrls.has(fullUrl)) {
                         visitedUrls.add(fullUrl);
-                        queue.enqueue({ url: fullUrl, depth: depth + 1 });
-                        
-                        // Store the parent-child relationship
-                        urlToParent.set(fullUrl, {
-                            parentUrl: url,
-                            nodeInfo: {
-                                url: fullUrl,
-                                title: text,
-                                children: []
-                            }
-                        });
+                        const nextDepth = 1 + depth;
+                        const childPage = {
+                            url: href,
+                            title: '',
+                            children: [],
+                            depth: nextDepth
+                        } as Page;
+                        queue.enqueue(childPage);
+                        page.children.push(childPage);
                     }
                 } catch (e) {
                     console.warn(`Invalid URL: ${href} on page ${url}`);
                 }
             });
             
-        } catch (error) {
+        } catch (error: any) {
             console.error(`Error crawling ${url}:`, error.message);
-        }
-    }
-    
-    // Build the tree structure from the collected relationships
-    for (const [url, { parentUrl, nodeInfo }] of urlToParent.entries()) {
-        const parentNode = parentUrl === baseURL ? siteTree : urlToParent.get(parentUrl)?.nodeInfo;
-        if (parentNode) {
-            parentNode.children.push(nodeInfo);
         }
     }
     
@@ -133,18 +117,36 @@ async function crawlSite(baseURL: string, rateLimitDelay: number, maxDepth: numb
 }
 
 async function main() {
+    const args = process.argv.slice(2);
+    const urlIndex = args.indexOf('--url');
+    const rateLimitIndex = args.indexOf('--rate-limit');
+    const maxDepthIndex = args.indexOf('--max-depth');
+    
+    if (urlIndex === -1) {
+        console.error('Usage: bun run snapshot.ts --url <url> [--rate-limit <ms>] [--max-depth <number>]');
+        process.exit(1);
+    }
+
+    const url = args[urlIndex + 1];
+    const rateLimitDelay = parseInt(args[rateLimitIndex + 1] ?? '50');
+    const maxDepth = parseInt(args[maxDepthIndex + 1] ?? '5');
+
+    if (!url) {
+        console.error('--url requires a value');
+        process.exit(1);
+    }
+
     try {
-        console.log('Starting to crawl docs.trunk.io...');
-        const navTree = await crawlSite(BASE_URL, RATE_LIMIT_DELAY, MAX_DEPTH);
+        console.log(`Starting to crawl ${url}...`);
+        const navTree = await crawlSite(new URL(url).toString(), rateLimitDelay, maxDepth);
         
         // Create output directory if it doesn't exist
         const outputDir = path.join(__dirname, 'snapshots');
-        await fs.mkdir(outputDir, { recursive: true });
+        await mkdir(outputDir, { recursive: true });
         
         // Write the navigation tree to a JSON file
-        const outputPath = path.join(outputDir, `${urlId(baseURL)}-${getGitShortHash()}.json`);
-        await fs.writeFile(outputPath, JSON.stringify(navTree, null, 2));
-        
+        const outputPath = path.join(outputDir, `${urlId(url)}.json`);
+        await Bun.write(outputPath, JSON.stringify(navTree, null, 2));
         console.log(`Navigation tree has been saved to ${outputPath}`);
     } catch (error) {
         console.error('Error in main:', error);
@@ -152,6 +154,7 @@ async function main() {
     }
 }
 
-// main();
+if (import.meta.main) {
+    main();
+}
 
-console.log(`${urlId(baseURL)}-${await getGitShortHash()}.json`); 
